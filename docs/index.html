@@ -37,7 +37,7 @@ class: middle, center
 
 # I'll be talking about
 
-* Public domain
+* Public domain: on behalf of Defra and BEIS
 * Last step: calculate and map emissions
 * Journey: personal thoughts and experiences
 * Improvements
@@ -71,24 +71,27 @@ class: middle, center
 
 * Encoded 6 bit binary ASCII format
 * Position (GNSS); timestamp; vessel type; vessel ID
-* Year 2014: 2 billion messages - 260GB
 * Fuel use from ship technical specifications
+* Year 2014: 2 billion messages - 260GB
 
 &lt;/br&gt;
 ## Pre-processed
 
-* 10GB .csv: fuel use/ship type/trip type/1km x 1km grid square
+* 10GB .csv
+* Fuel use/ship type/trip type
+* 1km x 1km grid
+  * &gt;3*10^6 grid cells
 
 
 ---
 
 # End product
 
-* Gridded data for Uk waters and beyond
+* Gridded data for Uk waters (and a bit beyond)
 * Annually reproducible workflow
   * Efficient
   * Modifiable
-  * Easy to Rre-purpose
+  * Easy to re-purpose
   * Transparent - auditing
 
 * Plays with legacy systems
@@ -99,185 +102,189 @@ class: middle, center
 
 ---
 
-
 # Pipeline
 
 .center[![:scale 100%](images/se_flow.png)]
 
 ---
 
-# Testing
-
-R
-
-SQLite
-
-PostgreSQL
-
----
-
-# Data flow
-
-DIAGRAM!
-
-
-Import: shell
-
-Data cleaning: R, dplyr, data.table, SQL
-
-
-
-R, GitLab, PostgreSQL
-
-
-ArcGIS server
-.aml
-GeoTiff
-Statistics
-
----
-
 # Calculate fuel consumption
 
-Chunking
+* SQL or R?
+* Data frames too big to be held in R memory
+* Solution: chunking
+  * read part db &gt; R &gt; process &gt; write part db
 
-1. Get chunking variable
-2. Fetch chunk from database
-3. Process
-4. Save back to database (create or append table)
-5. If more chunks remain repeat 2 to 4 else 6
-6. Stop
+--
 
----
-
-# Chunking
-
-
+## 1. Define the chunks
 
 ```r
 library(dbplyr)
 library(DBI)
 
-# Sourced from paramters.R file
-chunk_name &lt;- "myVar" # Chunking variable
-table_name &lt;- "myTable" # Raw table name
-new_table_name &lt;- "myNewTable" # Processed tbale name
-
 # Get variables to chunk with
-chunk_grp_sql &lt;- build_sql("SELECT DISTINCT ", sql(chunk_name), 
+chunk_grp_sql &lt;- build_sql("SELECT DISTINCT ", sql(chunk_var), 
                            " FROM ", sql(table_name))
+
+# read chunk var from db
 message("Getting chunking variable...")
 chunk_vars &lt;- dbSendQuery(conn, chunk_grp_sql)
 ```
 
+--- 
 
-{{
-# Split chunkvar into chunks
-i &lt;- 1 # Counter
-chunk_frac &lt;- 15 # Proportion of chunking variable to be read in at each pass
+## 2. Split chunk var into ~equal n chunks
 
-message("Splitting chunking variable into ", chunk_frac, " groups...")
-chunk_split &lt;- split(chunk_vars, sort(chunk_vars%%chunk_frac)) # Split chunk variable vector into parts for processing 
-max &lt;- max(length(chunk_split))
-}}
 
-For loop over chunk_var chunks...
+```r
+# Split chunk var vector into parts (`chunk_frac`) for processing 
+# How much can be handled in memory?
+chunk_split &lt;- split(chunk_vars, sort(chunk_vars%%chunk_frac)) 
+```
 
-{{
+--- 
+
+## 3. For loop over chunk 
+
+
+```r
 library(DBI)
 library(dplyr)
 
 for(i in 1:max) {
 
-# Connect to db &gt; pull chunk records...
-# Created get_chunk function
+# Connect to db &gt; pull chunk records using `get_chunk()` function
 chunk_data &lt;- get_chunk_fun(conn, table_name, chunk_start, chunk_end, chunk)
 
-# ...&gt; R process... 
-# Created get_chunk function
+# ...&gt; R process using `get_fuel_fun()` function
 output &lt;- get_fuel_fun(chunk_data, ...)
 
 # ...&gt; write to db
 dbWriteTable(conn, new_table_name, output, col_classes)
-
 }
+```
+---
 
-}}
+# Spatial outputs
 
+32 GeoTIFFs needed: combinations of pollutant; fuel type; trip type.
+
+Emission values normalised.
+
+--
+
+&lt;/br&gt;
+## R solution
+
+1. Generate empty raster covering grid
+2. Normalise emissions 
+3. Nested data frame of emissions by gridcode: `tidyr::nest`
+4. Join gridcoded emissions to raster cells using coords: functional programming `purrr::map`
+5. Export rasters: functional programming `purrr::pwalk`
 
 ---
 
-# Spatial data processing and outputs
+# 1. Raster generation
 
-Nested data frames
-
-Data normalisation: cell updates
-
-`purrr::walk`
-
-Use `purrr` to apply a function that:
-1. Joins emissions to points by grid ID
-2. Assigns emissions to raster cells
-3. Writes raster to file
+Generate empty raster to accept emission values later in process.
 
 
-{{
+```r
+# Make empty raster
+# Define CRS
+bng &lt;- '+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +ellps=airy +datum=OSGB36 +units=m +no_defs'
+
+# Get extent and resolution for raster from reference
+r_ext &lt;- raster::extent(uk_r)
+r_res &lt;- raster::res(uk_r)
+
+# Make raster
+r_empty &lt;- raster::raster(x = r_ext, res = r_res, crs = bng)
+```
+
+---
+
+# 3. Nested data frames
+
+.small[(skip 2. Normalise emissions)]
+
+
+```r
+library(tidyr)
+
+# gapminder dataset
+gapminder %&gt;%
+    nest(-country, -continent)
+```
+
+.center[![:scale 40%](images/nest.png)]
+
+Can apply functions to tables within a table.
+---
+
+# 4. Generate rasters
+
+
+```r
+# Benchmark time
 system.time({
-  ship_nest &lt;- ship_df_offshore %&gt;% group_by(year, pollutant) %&gt;% 
-    nest() %&gt;%
-    filter(year != 2014)
+
+  nested_emissions %&gt;%
+*    mutate(raster = map(data, ~ emission_raster(., points, r_empty))) %&gt;%
+    pwalk(function(grp_var1, grp_var2, raster) raster::writeRaster(raster, filename = paste0(out_n_path, "/ship", grp_var1, grp_var2), format = "GTiff"))
+
 })
 
-}}
+# Clean up
+gc()
+```
+&lt;/br&gt;
 
-Benchmark: 2018-05-02
-user  system elapsed 
-   8.19    1.81   10.02
+Use `purrr::map` to apply bespoke function `emission_raster()` to all data frames nested in *nested_emissions*.
 
-{{
-# Make null raster
-# Needed to accept gridded emission values into cells based on grid cell x, y values 
+Make a new column 'raster' in the nested data frame *nested_emissions* containing generated rasters.
 
-# Set some parameteres 
+---
+
+# 5. Write rasters
+
+
+```r
+# Benchmark time
 system.time({
-  bng &lt;- '+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +ellps=airy +datum=OSGB36 +units=m +no_defs'
-  r_ext &lt;- raster::extent(r)
-  r_ncol &lt;- raster::ncol(r)
-  r_nrow &lt;- raster::nrow(r)
-  
-  # Make raster
-  r_emissions &lt;- raster::raster(x = r_ext, nrows = r_nrow, ncols = r_ncol, crs = bng)
-})
-}}
 
-Benchmark: 2018-05-02
-user  system elapsed 
-   0.00    0.00    0.02
-
-
-{{
-source(here("scripts/R/emission_raster.R"))
-
-system.time({
-    
-  path &lt;- here("data/gis/mapping_grids")
-  
-  ship_em_nest &lt;- ship_nest %&gt;% 
-    mutate(raster = map(data, ~ emission_raster(., point_df, r_emissions))) %&gt;%
-    select(year, pollutant, raster) %&gt;%
-    pwalk(function(year, pollutant, raster) raster::writeRaster(raster, filename = paste0(path, "/", year, "_", pollutant), format = "GTiff"))
+  nested_emissions %&gt;%
+    mutate(raster = map(data, ~ emission_raster(., points, r_empty))) %&gt;%
+*    pwalk(function(grp_var1, grp_var2, raster) raster::writeRaster(raster, filename = paste0(my_output_path, "/my_directory", grp_var1, grp_var2), format = "GTiff"))
 
 })
-}}
 
+# Clean up
+gc()
+```
+&lt;/br&gt;
+Use `purrr::pwalk` to apply function `raster::writeRaster()` to all new rasters nested in `nested_emissions`.
+
+Name them according to some grouping vars.
+
+Generate and write 32 rasters takes about a minute on 16GB R2 2012 Windows server.
+
+---
+
+class: middle, center
+
+# Result using `viridis`
+
+&lt;iframe width="700" height="500" src="https://ricardo-aea.maps.arcgis.com/apps/StorytellingSwipe/index.html?appid=b52b396c0f314723a166aa552209f544" frameborder="0" allow="encrypted-media" allowfullscreen&gt;&lt;/iframe&gt;
 
 ---
 
 # Experiences
 
+* 
 
-
----
+--
 
 # Lessons
 
